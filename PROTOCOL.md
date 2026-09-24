@@ -118,6 +118,8 @@ URL：`wss://${location.host}/xiaozhi/v1/?device-id=<id>&client-id=<uuid>`
 - 客户端发送：`{"type":"abort"}`。server **不读取任何其他字段**。
   测试页还会带 `session_id` 和 `reason:"wake_word_detected"`，这两个字段没有作用。
 - server 的处理：设置 `client_abort = True`，清空队列，并回复 `{"type":"tts","state":"stop","session_id":...}`（`:16-18`）。
+- `client_abort` 在下一轮 TTS 收到 `SentenceType.FIRST` 时清除（`S/core/providers/tts/base.py` 的 `tts_text_priority_thread`）。这一行在移植时丢过，2026-09-24 已恢复；没有它的话，打断一次后所有回复都会被丢掉。
+- **严格门控**：`client_is_speaking=True` 期间，ASR 线程会**丢弃所有上行音频**（`S/core/providers/asr/base.py` 的 `asr_text_priority_thread`）。这个标记在识别出文字后变成 True，在 `tts stop` 或 abort 时清除。所以 TTS 还在播放时按下说话，**必须先发 abort**，否则这段录音会被直接丢掉。
 
 ### ping
 
@@ -211,7 +213,7 @@ _free(pcmPtr); _free(outPtr)
 
 输入是 Int16Array，长度必须正好 960（16k 下的 60ms）。
 
-注意：variadic 的 `_opus_encoder_ctl` 在这个 asm.js 构建里可以直接传第三个参数，测试页就是这么用的。如果某项 ctl 在 iOS 上报错，可以先去掉 ctl，编码仍然可用。
+⚠️ **测试页的 ctl 用法是错的（2026-09-24 实测）**：在 asm.js 构建里，`_opus_encoder_ctl` 的变参要以**指向堆内存的指针**传入。测试页直接传 `16000`，实测会把码率设成 **300000**。正确写法：先 `HEAP32[p>>2]=24000`，再调用 `_opus_encoder_ctl(enc, 4002, p)`，用 `OPUS_GET_BITRATE`(4003) 读回来是 24000。web-client 用的是指针写法。
 
 **解码器**（`T/js/core/audio/player.js:36-148`）
 

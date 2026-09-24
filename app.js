@@ -1,4 +1,4 @@
-// xiaozhi web-client —— 文字对话 + TTS 播放
+// xiaozhi web-client —— 文字对话 + 按住说话 + TTS 播放
 // 协议细节见 PROTOCOL.md
 
 'use strict';
@@ -60,6 +60,7 @@ function setStatus(state, text) {
   $statusText.textContent = text;
   $send.disabled = state !== 'ready';
   $reconnect.hidden = state !== 'disconnected';
+  updateTalkButton();
 }
 
 function scrollToBottom() {
@@ -170,6 +171,55 @@ function createOpusDecoder() {
   return { decode, reset };
 }
 
+// ---------- Opus 编码 ----------
+// 上行：16kHz、单声道、每帧 960 个 Int16 采样点。
+// 注意 _opus_encoder_ctl 是变参函数，asm.js 里变参要以「指向堆内存的指针」传入；
+// 官方测试页直接传数值，实测会把码率设成 300000。
+
+const OPUS_APPLICATION_VOIP = 2048;
+const OPUS_SET_BITRATE = 4002;
+const OPUS_BITRATE = 24000;
+
+function createOpusEncoder() {
+  const mod = (typeof Module !== 'undefined' && Module.instance) || null;
+  if (!mod || typeof mod._opus_encoder_get_size !== 'function') {
+    console.log('[mic] libopus not loaded, Module.instance missing');
+    return null;
+  }
+
+  const encPtr = mod._malloc(mod._opus_encoder_get_size(1));
+  const pcmPtr = mod._malloc(960 * 2);
+  const outPtr = mod._malloc(OPUS_MAX_PACKET);
+  const argPtr = mod._malloc(4);
+
+  function reset() {
+    const err = mod._opus_encoder_init(encPtr, OPUS_RATE, 1, OPUS_APPLICATION_VOIP);
+    if (err < 0) {
+      console.log('[mic] opus_encoder_init failed', err);
+      return false;
+    }
+    mod.HEAP32[argPtr >> 2] = OPUS_BITRATE;
+    const ret = mod._opus_encoder_ctl(encPtr, OPUS_SET_BITRATE, argPtr);
+    if (ret < 0) console.log('[mic] OPUS_SET_BITRATE failed', ret);
+    return true;
+  }
+
+  // pcm: Int16Array(960)；返回 Uint8Array，失败返回 null
+  function encode(pcm) {
+    mod.HEAP16.set(pcm, pcmPtr >> 1);
+    const len = mod._opus_encode(encPtr, pcmPtr, pcm.length, outPtr, OPUS_MAX_PACKET);
+    if (len < 0) {
+      console.log('[mic] opus_encode error', len);
+      return null;
+    }
+    return mod.HEAPU8.slice(outPtr, outPtr + len);
+  }
+
+  if (!reset()) return null;
+  console.log('[mic] opus encoder ready, bitrate=' + OPUS_BITRATE);
+  return { encode, reset };
+}
+
 // ---------- 重采样 ----------
 // 16kHz → AudioContext 原生采样率的流式线性插值。
 // 跨包保留上一包最后一个采样点和小数位置，保证包与包之间波形连续（无爆音）。
@@ -227,8 +277,8 @@ function newTurnStats() {
 // 必须在用户点击/按键事件里同步调用（iOS 要求）
 function unlockAudio() {
   try {
-    if (navigator.audioSession && navigator.audioSession.type !== 'playback') {
-      // 让 iPhone 静音键不影响播放
+    // 让 iPhone 静音键不影响播放；麦克风启用后要保持 play-and-record，不能改回来
+    if (navigator.audioSession && micState === 'off' && navigator.audioSession.type !== 'playback') {
       navigator.audioSession.type = 'playback';
       console.log('[audio] audioSession.type=playback');
     }
@@ -321,7 +371,13 @@ function resetPlaybackQueue() {
   if (resampler) resampler.reset();
 }
 
-// 断线时立即停止所有已排队的音频
+// 本轮 TTS 是否还在进行：server 未发 tts stop，或本地还有没播完的音频
+function isBotSpeaking() {
+  const queued = audioCtx ? nextStartTime - audioCtx.currentTime > 0.05 : false;
+  return serverSpeaking || queued;
+}
+
+// 断线或打断时立即停止所有已排队的音频
 function stopAllAudio() {
   for (const src of activeSources) {
     try {
@@ -345,6 +401,9 @@ const HELLO_TIMEOUT_MS = 5000;
 let ws = null;
 let sessionId = null;
 let helloTimer = null;
+let serverSpeaking = false; // tts start → true，tts stop → false
+// 发 abort 后，server 发送队列里可能还有 0~1 帧旧音频在路上；丢弃直到下一轮 tts start
+let dropStaleAudio = false;
 
 function connect() {
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
@@ -366,6 +425,8 @@ function connect() {
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {
       handleText(event.data);
+    } else if (dropStaleAudio) {
+      console.log('[audio] dropped stale frame after abort, ' + event.data.byteLength + ' bytes');
     } else {
       playOpusFrame(event.data);
     }
@@ -380,7 +441,10 @@ function connect() {
     clearTimeout(helloTimer);
     ws = null;
     sessionId = null;
+    serverSpeaking = false;
+    dropStaleAudio = false;
     resetTurn();
+    cancelRecording('socket closed');
     stopAllAudio();
     setStatus('disconnected', 'Disconnected');
     addNotice('Connection lost');
@@ -440,10 +504,14 @@ function handleText(raw) {
       break;
 
     case 'tts':
-      if (msg.state === 'sentence_start' && msg.text) {
+      if (msg.state === 'start') {
+        serverSpeaking = true;
+        dropStaleAudio = false;
+      } else if (msg.state === 'sentence_start' && msg.text) {
         onAssistantText(msg.text);
       } else if (msg.state === 'stop') {
         console.log('[ws] tts stop, turn finished');
+        serverSpeaking = false;
         resetPlaybackQueue();
       }
       break;
@@ -456,6 +524,216 @@ function handleText(raw) {
       console.log('[ws] unhandled type', msg.type);
   }
 }
+
+// ---------- 麦克风 / 按住说话 ----------
+// 首次按下时申请麦克风并加载 mic-worklet.js；授权完成时如果还按着，直接开始录音。
+// 按下：（TTS 播放中则先清空播放队列并发 abort）→ listen start → 逐帧 Opus 编码上传
+// 松开：worklet 补齐最后一帧 → 等 STOP_DELAY_MS（让 server 把音频帧搬进 ASR 缓冲）→ listen stop
+
+const STOP_DELAY_MS = 150;
+const STOP_FALLBACK_MS = 600; // worklet 没回 stopped 时的兜底
+const MIN_FRAMES = 5;         // 少于 0.3s 基本识别不出来，给提示
+
+const $talk = document.getElementById('talkBtn');
+
+let micState = 'off'; // 'off' | 'initializing' | 'ready'
+let micStream = null;
+let micSource = null;
+let micNode = null;
+let encoder = null;
+let pressing = false;      // 手指/鼠标是否按着
+let recording = false;     // 已发 listen start，正在上传
+let awaitingStop = false;  // 已松开，等 worklet 发完最后一帧
+let stopFallbackTimer = null;
+let recStats = null;
+
+function updateTalkButton() {
+  const ready = !!sessionId;
+  $talk.disabled = !ready;
+  $talk.classList.toggle('recording', recording);
+  if (micState === 'initializing') $talk.textContent = 'Enabling mic…';
+  else if (recording) $talk.textContent = 'Release to send';
+  else $talk.textContent = 'Hold to talk';
+  if (!recording) $talk.style.setProperty('--level', '0');
+}
+
+async function initMic() {
+  micState = 'initializing';
+  updateTalkButton();
+  try {
+    unlockAudio();
+    try {
+      if (navigator.audioSession) {
+        navigator.audioSession.type = 'play-and-record';
+        console.log('[mic] audioSession.type=play-and-record');
+      }
+    } catch (e) {
+      console.log('[mic] audioSession not settable', e);
+    }
+
+    // 关掉回声消除/降噪/自动增益：按住说话是半双工，用不到；
+    // 而且 iOS 开启语音处理后 TTS 播放音量会明显变小
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    const track = micStream.getAudioTracks()[0];
+    console.log('[mic] permission granted, track settings=' + JSON.stringify(track.getSettings()));
+    track.onended = () => {
+      console.log('[mic] track ended (interrupted or revoked), will re-init on next press');
+      cancelRecording('track ended');
+      teardownMic();
+    };
+
+    await audioCtx.audioWorklet.addModule('mic-worklet.js');
+    micSource = audioCtx.createMediaStreamSource(micStream);
+    micNode = new AudioWorkletNode(audioCtx, 'mic-processor', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    });
+    micNode.port.onmessage = onMicMessage;
+    // 节点要连到 destination 才会被驱动；输出是静音
+    const mute = audioCtx.createGain();
+    mute.gain.value = 0;
+    micSource.connect(micNode);
+    micNode.connect(mute);
+    mute.connect(audioCtx.destination);
+
+    if (!encoder) encoder = createOpusEncoder();
+    if (!encoder) throw new Error('opus encoder unavailable');
+
+    micState = 'ready';
+    console.log('[mic] ready, context sampleRate=' + audioCtx.sampleRate + ' state=' + audioCtx.state);
+    if (pressing) startRecording();
+  } catch (e) {
+    console.log('[mic] init failed', e);
+    addNotice('Microphone unavailable: ' + (e && e.message ? e.message : e));
+    teardownMic();
+  }
+  updateTalkButton();
+}
+
+function teardownMic() {
+  try {
+    if (micSource) micSource.disconnect();
+    if (micNode) micNode.disconnect();
+  } catch (e) {
+    // 已断开，忽略
+  }
+  if (micStream) micStream.getTracks().forEach((t) => t.stop());
+  micStream = null;
+  micSource = null;
+  micNode = null;
+  micState = 'off';
+}
+
+function startRecording() {
+  if (!sessionId || recording || awaitingStop || micState !== 'ready') return;
+
+  if (isBotSpeaking()) {
+    console.log('[mic] barge-in while TTS playing: clear playback + abort');
+    stopAllAudio();
+    serverSpeaking = false;
+    dropStaleAudio = true;
+    sendJson({ type: 'abort' });
+  }
+
+  encoder.reset();
+  recStats = { frames: 0, bytes: 0, peak: 0, t0: performance.now() };
+  recording = true;
+  sendJson({ type: 'listen', mode: 'manual', state: 'start' });
+  micNode.port.postMessage({ cmd: 'start' });
+  console.log('[mic] recording started');
+  updateTalkButton();
+}
+
+function stopRecording() {
+  if (!recording) return;
+  recording = false;
+  awaitingStop = true;
+  micNode.port.postMessage({ cmd: 'stop' });
+  clearTimeout(stopFallbackTimer);
+  stopFallbackTimer = setTimeout(() => {
+    console.log('[mic] worklet did not confirm stop in ' + STOP_FALLBACK_MS + 'ms, sending listen stop anyway');
+    finishRecording();
+  }, STOP_FALLBACK_MS);
+  updateTalkButton();
+}
+
+function finishRecording() {
+  if (!awaitingStop) return;
+  awaitingStop = false;
+  clearTimeout(stopFallbackTimer);
+  const s = recStats;
+  setTimeout(() => {
+    sendJson({ type: 'listen', mode: 'manual', state: 'stop' });
+    console.log('[mic] recording done: frames=' + s.frames + ' audio=' + (s.frames * 0.06).toFixed(2) + 's bytes=' + s.bytes +
+      ' peak=' + s.peak.toFixed(3) + ' held=' + ((performance.now() - s.t0) / 1000).toFixed(2) + 's');
+    if (s.frames < MIN_FRAMES) addNotice('Too short — hold the button while you speak');
+    else if (s.peak < 0.01) addNotice('No sound picked up — check the microphone');
+  }, STOP_DELAY_MS);
+}
+
+// 断线/中断时丢弃本次录音，不发 listen stop
+function cancelRecording(reason) {
+  if (!recording && !awaitingStop) return;
+  console.log('[mic] recording cancelled: ' + reason);
+  recording = false;
+  awaitingStop = false;
+  clearTimeout(stopFallbackTimer);
+  if (micNode) micNode.port.postMessage({ cmd: 'stop' });
+  updateTalkButton();
+}
+
+function onMicMessage(event) {
+  const msg = event.data;
+  if (msg.type === 'ready') {
+    console.log('[mic] worklet ready, input sampleRate=' + msg.sampleRate + ' → 16000');
+  } else if (msg.type === 'frame') {
+    if (!recording && !awaitingStop) return;
+    const packet = encoder.encode(msg.pcm);
+    if (!packet || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(packet);
+    recStats.frames++;
+    recStats.bytes += packet.length;
+    if (msg.peak > recStats.peak) recStats.peak = msg.peak;
+    if (recStats.frames === 1) console.log('[mic] first frame sent, ' + packet.length + ' bytes');
+    if (recording) $talk.style.setProperty('--level', Math.min(1, msg.peak * 3).toFixed(2));
+  } else if (msg.type === 'stopped') {
+    finishRecording();
+  }
+}
+
+function pressStart(source) {
+  if (pressing || $talk.disabled) return;
+  pressing = true;
+  console.log('[mic] press (' + source + ')');
+  unlockAudio();
+  if (micState === 'ready') startRecording();
+  else if (micState === 'off') initMic();
+  updateTalkButton();
+}
+
+function pressEnd(source) {
+  if (!pressing) return;
+  pressing = false;
+  console.log('[mic] release (' + source + ')');
+  // touchend/mouseup 是 iOS 认可的用户手势，再解锁一次音频
+  unlockAudio();
+  stopRecording();
+  updateTalkButton();
+}
+
+// touch：preventDefault 阻止随后合成的 mouse 事件、长按菜单和页面滚动
+$talk.addEventListener('touchstart', (e) => { e.preventDefault(); pressStart('touch'); }, { passive: false });
+$talk.addEventListener('touchend', (e) => { e.preventDefault(); pressEnd('touch'); }, { passive: false });
+$talk.addEventListener('touchcancel', (e) => { e.preventDefault(); pressEnd('touchcancel'); }, { passive: false });
+// mouse：在按钮上按下，在窗口任意位置松开都算
+$talk.addEventListener('mousedown', (e) => { if (e.button === 0) pressStart('mouse'); });
+window.addEventListener('mouseup', (e) => { if (e.button === 0) pressEnd('mouse'); });
+$talk.addEventListener('contextmenu', (e) => e.preventDefault());
+// 切到后台时当作松开
+document.addEventListener('visibilitychange', () => { if (document.hidden) pressEnd('hidden'); });
 
 // ---------- 输入 ----------
 
