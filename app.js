@@ -351,7 +351,7 @@ function connect() {
 
   const url = buildWsUrl();
   console.log('[ws] connecting', url);
-  setStatus('connecting', '连接中…');
+  setStatus('connecting', 'Connecting…');
   sessionId = null;
 
   ws = new WebSocket(url);
@@ -359,7 +359,7 @@ function connect() {
 
   ws.onopen = () => {
     console.log('[ws] open');
-    setStatus('connecting', '握手中…');
+    setStatus('connecting', 'Handshaking…');
     sendHello();
   };
 
@@ -382,8 +382,8 @@ function connect() {
     sessionId = null;
     resetTurn();
     stopAllAudio();
-    setStatus('disconnected', '已断开');
-    addNotice('连接已断开');
+    setStatus('disconnected', 'Disconnected');
+    addNotice('Connection lost');
   };
 }
 
@@ -409,7 +409,7 @@ function sendHello() {
   clearTimeout(helloTimer);
   helloTimer = setTimeout(() => {
     console.log('[ws] hello timeout, no reply in ' + HELLO_TIMEOUT_MS + 'ms');
-    setStatus('connecting', '握手超时');
+    setStatus('connecting', 'Handshake timed out');
   }, HELLO_TIMEOUT_MS);
 }
 
@@ -428,7 +428,7 @@ function handleText(raw) {
       clearTimeout(helloTimer);
       sessionId = msg.session_id;
       console.log('[ws] hello ok, session_id=' + sessionId + ' audio_params=' + JSON.stringify(msg.audio_params));
-      setStatus('ready', '已连接');
+      setStatus('ready', 'Connected');
       break;
 
     case 'stt':

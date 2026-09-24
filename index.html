@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -133,15 +133,15 @@
   <header>
     <span id="statusDot"></span>
     <h1>T1D Chat</h1>
-    <span id="statusText">未连接</span>
-    <button id="reconnectBtn" type="button" hidden>重连</button>
+    <span id="statusText">Disconnected</span>
+    <button id="reconnectBtn" type="button" hidden>Reconnect</button>
   </header>
 
   <main id="messages"></main>
 
   <form id="inputForm" autocomplete="off">
-    <input id="textInput" type="text" placeholder="输入消息…" enterkeyhint="send">
-    <button id="sendBtn" type="submit" disabled>发送</button>
+    <input id="textInput" type="text" placeholder="Type a message…" enterkeyhint="send">
+    <button id="sendBtn" type="submit" disabled>Send</button>
   </form>
 
   <!-- 与 server 仓库 test/js/utils/libopus.js 相同（asm.js 构建，同步初始化，导出 Module.instance） -->
