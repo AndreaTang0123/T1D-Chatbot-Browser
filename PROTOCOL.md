@@ -55,6 +55,9 @@ URL：`wss://${location.host}/xiaozhi/v1/?device-id=<id>&client-id=<uuid>`
 - 不带 `audio_params` 时 `audio_format` 保持默认值 `"opus"`（`connection.py:118`）。
 - 官方测试页发送的是 `{type, device_id, device_name, device_mac, token, features:{mcp:true}}`（`T/js/core/network/websocket.js:29-38`），这些字段 server 都不读取。
 - `features.mcp: true` 会让 server 在第一条非 hello 消息时发起 MCP `initialize` 和 `tools/list`（`textMessageProcessor.py:31-39`），客户端需要回复。**web-client 建议填 `mcp: false`**。
+- `features.server_tts: false`（**2026-10-05 本项目新增，经确认后修改 server**）：server 不合成语音、不调用 TTS 服务，也就不会把回复文本发给 Edge TTS。
+  `tts start / sentence_start / stop` 照常下发，只是没有二进制 opus 帧。实现：`helloHandle.py` 写 `conn.server_tts_enabled`，`S/core/providers/tts/base.py` 的 `to_tts_stream` 在它为 False 时只入队句子标记。
+  不带这个字段（ESP32 设备）行为不变。web-client 现在发 `server_tts: false`，回复由浏览器端 `tts-player.js` 朗读。
 
 **server → 客户端**（`helloHandle.py:59-74`，发送前 sleep 0.1 秒）：
 

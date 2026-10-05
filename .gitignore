@@ -1,0 +1,12 @@
+# API key 等本地配置
+.env
+.env.*
+!.env.example
+# Python 虚拟环境
+.venv/
+__pycache__/
+# 音频文件
+*.wav
+*.mp3
+*.m4a
+.DS_Store

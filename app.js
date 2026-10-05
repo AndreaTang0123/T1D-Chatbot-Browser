@@ -1,4 +1,4 @@
-// xiaozhi web-client —— 文字对话 + 按住说话 + TTS 播放
+// xiaozhi web-client —— 文字对话 + 按住说话 + 语音回复（TTS 由 tts-player.js 在浏览器端完成）
 // 协议细节见 PROTOCOL.md
 
 'use strict';
@@ -307,6 +307,7 @@ function unlockAudio() {
     );
   }
   if (!decoder) decoder = createOpusDecoder();
+  TTSPlayer.unlock();
 }
 
 function playOpusFrame(buffer) {
@@ -374,7 +375,7 @@ function resetPlaybackQueue() {
 // 本轮 TTS 是否还在进行：server 未发 tts stop，或本地还有没播完的音频
 function isBotSpeaking() {
   const queued = audioCtx ? nextStartTime - audioCtx.currentTime > 0.05 : false;
-  return serverSpeaking || queued;
+  return serverSpeaking || queued || TTSPlayer.isSpeaking();
 }
 
 // 断线或打断时立即停止所有已排队的音频
@@ -387,6 +388,7 @@ function stopAllAudio() {
     }
   }
   activeSources.clear();
+  TTSPlayer.stop();
   nextStartTime = 0;
   turnStats = null;
   if (decoder) decoder.reset();
@@ -467,7 +469,8 @@ function sendHello() {
     type: 'hello',
     version: 1,
     transport: 'websocket',
-    features: { mcp: false },
+    // server_tts:false —— server 只下发回复文本，不合成语音（也就不会把文本发给 Edge TTS）
+    features: { mcp: false, server_tts: false },
     audio_params: { format: 'opus', sample_rate: 16000, channels: 1, frame_duration: 60 },
   });
   clearTimeout(helloTimer);
@@ -498,6 +501,7 @@ function handleText(raw) {
     case 'stt':
       // 就绪通知 {state:"listening"} 没有 text
       if (msg.text) {
+        TTSPlayer.stop();
         resetTurn();
         addBubble('user', msg.text);
       }
@@ -513,6 +517,8 @@ function handleText(raw) {
         console.log('[ws] tts stop, turn finished');
         serverSpeaking = false;
         resetPlaybackQueue();
+        // 所有 sentence_start（含全文）都先于 stop 到达，此时 botText 是完整回复
+        if (botText) TTSPlayer.speak(botText);
       }
       break;
 
@@ -754,5 +760,10 @@ $reconnect.addEventListener('click', () => {
   connect();
 });
 
+// 首次点击页面任意位置也解锁 TTS（iOS 要求首次发声在用户手势里）
+document.addEventListener('touchend', () => TTSPlayer.unlock(), { once: true });
+document.addEventListener('click', () => TTSPlayer.unlock(), { once: true });
+
+TTSPlayer.init();
 console.log('[ws] device-id=' + deviceId + ' client-id=' + clientId + (clientId === JOE_CLIENT_ID ? ' (Joe)' : ' (override)'));
 connect();
